@@ -1,8 +1,9 @@
 import argparse
 import glob
+import json
 import shutil
 from pathlib import Path
-from typing import Callable, Optional, Union
+from typing import Callable, List, Optional, Set, Union
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -102,6 +103,59 @@ def mixed_quant_predicate_builder(
     return mixed_quant_predicate
 
 
+def _build_skip_set(modules_to_not_convert: List[str]) -> Set[str]:
+    """Build a set of normalized module paths for skip matching.
+
+    HuggingFace paths use a ``model.`` prefix (the HF wrapper) and may omit
+    intermediate containers that exist in the MLX model tree (e.g. the inner
+    ``.model`` inside ``LanguageModel``).  We generate several normalised
+    variants of every entry so that a simple set/endswith lookup against the
+    MLX ``named_modules()`` paths will match correctly.
+    """
+    skip: Set[str] = set()
+    for path in modules_to_not_convert:
+        skip.add(path)
+        # Strip leading "model." prefix (HF wrapper)
+        if path.startswith("model."):
+            stripped = path[len("model."):]
+            skip.add(stripped)
+            # Insert ".model" after the first component to account for the
+            # inner model container in MLX LanguageModel classes.
+            # e.g. "language_model.layers.0.mlp.gate"
+            #    → "language_model.model.layers.0.mlp.gate"
+            parts = stripped.split(".", 1)
+            if len(parts) == 2:
+                skip.add(f"{parts[0]}.model.{parts[1]}")
+    return skip
+
+
+def _should_skip_module(mlx_path: str, skip_set: Set[str]) -> bool:
+    """Check whether *mlx_path* matches any entry in *skip_set*."""
+    if mlx_path in skip_set:
+        return True
+    for skip_path in skip_set:
+        if mlx_path.endswith("." + skip_path):
+            return True
+    return False
+
+
+def load_modules_to_not_convert(quant_config_path: str) -> List[str]:
+    """Load modules_to_not_convert from a config.json that contains a
+    ``quantization_config`` section."""
+    path = Path(quant_config_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Quant config not found: {path}")
+    with open(path, encoding="utf-8") as f:
+        cfg = json.load(f)
+    qcfg = cfg.get("quantization_config", {})
+    modules = qcfg.get("modules_to_not_convert", [])
+    if not modules:
+        raise ValueError(
+            f"No modules_to_not_convert found in {path}"
+        )
+    return modules
+
+
 def convert(
     hf_path: str,
     mlx_path: str = "mlx_model",
@@ -115,6 +169,7 @@ def convert(
     dequantize: bool = False,
     trust_remote_code: bool = True,
     quant_predicate: Optional[str] = None,
+    quant_config: Optional[str] = None,
 ):
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
@@ -124,8 +179,17 @@ def convert(
 
     model_quant_predicate = getattr(model, "quant_predicate", None)
 
+    # Load modules to skip from an external quantization config
+    skip_set: Optional[Set[str]] = None
+    if quant_config is not None:
+        modules_to_not_convert = load_modules_to_not_convert(quant_config)
+        skip_set = _build_skip_set(modules_to_not_convert)
+        print(f"[INFO] Loaded {len(modules_to_not_convert)} modules to skip from {quant_config}")
+
     def base_quant_predicate(path, module):
         if skip_multimodal_module(path):
+            return False
+        if skip_set is not None and _should_skip_module(path, skip_set):
             return False
         if model_quant_predicate is not None:
             return model_quant_predicate(path, module)
@@ -284,6 +348,13 @@ def configure_parser() -> argparse.ArgumentParser:
         help="Trust remote code.",
         action="store_true",
         default=False,
+    )
+    parser.add_argument(
+        "--quant-config",
+        help="Path to a config.json containing quantization_config with "
+        "modules_to_not_convert. Listed modules will be skipped during quantization.",
+        type=str,
+        default=None,
     )
     return parser
 
