@@ -91,6 +91,36 @@ def skip_multimodal_module(path: str) -> bool:
     )
 
 
+def get_class_predicate(skip_vision=False, weights=None, config=None):
+    """
+    Return a class predicate for nn.quantize that decides which modules to quantize.
+
+    Args:
+        skip_vision: If True, skip vision/audio multimodal modules.
+        weights: Optional weight dict; when provided, only quantize layers whose
+            ``{path}.scales`` key exists in *weights*.
+        config: Optional per-layer quantization config dict.
+
+    Returns:
+        A predicate ``(path, module) -> bool`` suitable for ``nn.quantize``.
+    """
+
+    def predicate(p, m):
+        if skip_multimodal_module(p) and skip_vision:
+            return False
+        if config and p in config:
+            return config[p]
+        if not hasattr(m, "to_quantized"):
+            return False
+        if hasattr(m, "weight") and m.weight.size % 64 != 0:
+            return False
+        if weights is not None:
+            return f"{p}.scales" in weights
+        return True
+
+    return predicate
+
+
 def get_model_and_args(config: dict):
     """
     Retrieve the model object based on the configuration.
@@ -282,27 +312,16 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         # TODO: Re-upload the models with the new quantization config and remove this
         skip_vision = config.get("vision_config", {}).get("skip_vision", False)
 
-        def get_class_predicate(p, m):
-            # Always skip vision and audio models
-            if skip_multimodal_module(p) and skip_vision:
-                return False
-            # Handle custom per layer quantizations
-            if p in config["quantization"]:
-                return config["quantization"][p]
-            if not hasattr(m, "to_quantized"):
-                return False
-            # Skip layers not divisible by 64
-            if hasattr(m, "weight") and m.weight.size % 64 != 0:
-                return False
-            # Handle legacy models which may not have everything quantized
-            return f"{p}.scales" in weights
-
         nn.quantize(
             model,
             group_size=quantization["group_size"],
             bits=quantization["bits"],
             mode=quantization.get("mode", "affine"),
-            class_predicate=get_class_predicate,
+            class_predicate=get_class_predicate(
+                skip_vision=skip_vision,
+                weights=weights,
+                config=config["quantization"],
+            ),
         )
 
     if kwargs.get("quantize_activations", False):
